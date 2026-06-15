@@ -45,6 +45,8 @@ const (
 	commitOrRollbackCommit = 8
 
 	commitOrRollbackRollback = 12
+
+	maxFrameSize = 1024 * 1024 // 1MB upper bound for remoting frame to prevent OOM
 )
 
 var opaqueCounter int32
@@ -249,6 +251,9 @@ func (s *defaultTCPSender) Send(addr string, data []byte, timeout time.Duration)
 	if frameLen < 8 {
 		return fmt.Errorf("broker %s response frame too short: %d", addr, frameLen)
 	}
+	if frameLen > maxFrameSize {
+		return fmt.Errorf("broker %s response frame too large: %d", addr, frameLen)
+	}
 	frameBuf := make([]byte, frameLen)
 	if _, err := readFull(conn, frameBuf); err != nil {
 		return fmt.Errorf("read response frame from broker %s failed: %w", addr, err)
@@ -329,6 +334,9 @@ func queryBrokerAddrFromNameServer(nameServerAddr string, topic string, brokerNa
 	if frameLen < 8 {
 		return "", fmt.Errorf("name server %s response frame too short: %d", nameServerAddr, frameLen)
 	}
+	if frameLen > maxFrameSize {
+		return "", fmt.Errorf("name server %s response frame too large: %d", nameServerAddr, frameLen)
+	}
 
 	frameBuf := make([]byte, frameLen)
 	if _, err := readFull(conn, frameBuf); err != nil {
@@ -374,7 +382,7 @@ func decodeResponseHeader(data []byte) (map[string]string, error) {
 		return nil, fmt.Errorf("header too short for fixed fields")
 	}
 	discard := make([]byte, 13)
-	if _, err := buf.Read(discard); err != nil {
+	if _, err := io.ReadFull(buf, discard); err != nil {
 		return nil, err
 	}
 
@@ -382,9 +390,12 @@ func decodeResponseHeader(data []byte) (map[string]string, error) {
 	if err := binary.Read(buf, binary.BigEndian, &remarkLen); err != nil {
 		return nil, err
 	}
+	if remarkLen < 0 || int(remarkLen) > buf.Len() {
+		return nil, fmt.Errorf("invalid remark length: %d", remarkLen)
+	}
 	if remarkLen > 0 {
 		discardRemark := make([]byte, remarkLen)
-		if _, err := buf.Read(discardRemark); err != nil {
+		if _, err := io.ReadFull(buf, discardRemark); err != nil {
 			return nil, err
 		}
 	}
@@ -393,29 +404,38 @@ func decodeResponseHeader(data []byte) (map[string]string, error) {
 	if err := binary.Read(buf, binary.BigEndian, &extLen); err != nil {
 		return nil, err
 	}
+	if extLen < 0 || int(extLen) > buf.Len() {
+		return nil, fmt.Errorf("invalid ext fields length: %d", extLen)
+	}
 	extFields := make(map[string]string)
 	if extLen > 0 {
 		extData := make([]byte, extLen)
-		if _, err := buf.Read(extData); err != nil {
+		if _, err := io.ReadFull(buf, extData); err != nil {
 			return nil, err
 		}
 		extBuf := bytes.NewReader(extData)
 		for extBuf.Len() > 0 {
 			var kLen int16
 			if err := binary.Read(extBuf, binary.BigEndian, &kLen); err != nil {
-				break
+				return nil, fmt.Errorf("read ext key length failed: %w", err)
+			}
+			if kLen < 0 || int(kLen) > extBuf.Len() {
+				return nil, fmt.Errorf("invalid ext key length: %d", kLen)
 			}
 			key := make([]byte, kLen)
-			if _, err := extBuf.Read(key); err != nil {
-				break
+			if _, err := io.ReadFull(extBuf, key); err != nil {
+				return nil, fmt.Errorf("read ext key failed: %w", err)
 			}
 			var vLen int32
 			if err := binary.Read(extBuf, binary.BigEndian, &vLen); err != nil {
-				break
+				return nil, fmt.Errorf("read ext value length failed: %w", err)
+			}
+			if vLen < 0 || int(vLen) > extBuf.Len() {
+				return nil, fmt.Errorf("invalid ext value length: %d", vLen)
 			}
 			value := make([]byte, vLen)
-			if _, err := extBuf.Read(value); err != nil {
-				break
+			if _, err := io.ReadFull(extBuf, value); err != nil {
+				return nil, fmt.Errorf("read ext value failed: %w", err)
 			}
 			extFields[string(key)] = string(value)
 		}

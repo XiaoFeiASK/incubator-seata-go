@@ -465,7 +465,7 @@ func TestDefaultBrokerAddrResolver_TriesAllNameServers(t *testing.T) {
 	resolver := &defaultBrokerAddrResolver{}
 
 	_, err := resolver.ResolveBrokerAddr(
-		[]string{"invalid-addr-1:9876", "invalid-addr-2:9876"},
+		[]string{"127.0.0.1:1", "127.0.0.1:1"},
 		"test-topic",
 		"broker-a",
 	)
