@@ -24,7 +24,7 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -42,11 +42,22 @@ const (
 
 	rmqHeaderFixedLength = 21
 
+	// rmqResponseHeaderFixedPartLength is the size of the fixed fields in a
+	// RocketMQ remoting response header:
+	// code(2) + language(1) + version(2) + opaque(4) + flag(4) = 13 bytes.
+	rmqResponseHeaderFixedPartLength = 13
+
 	commitOrRollbackCommit = 8
 
 	commitOrRollbackRollback = 12
 
 	maxFrameSize = 1024 * 1024 // 1MB upper bound for remoting frame to prevent OOM
+
+	defaultConnPoolSize = 4
+
+	connPoolCleanInterval = 60 // seconds
+
+	connPoolIdleTimeout = 600 // seconds (10 minutes)
 )
 
 var opaqueCounter int32
@@ -170,15 +181,9 @@ func encodeExtFields(fields map[string]string) ([]byte, error) {
 	if len(fields) == 0 {
 		return []byte{}, nil
 	}
-	keys := make([]string, 0, len(fields))
-	for k := range fields {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
 
 	buf := bytes.NewBuffer(nil)
-	for _, key := range keys {
-		value := fields[key]
+	for key, value := range fields {
 		if err := binary.Write(buf, binary.BigEndian, int16(len(key))); err != nil {
 			return nil, err
 		}
@@ -205,18 +210,19 @@ func markProtocolType(source int32) []byte {
 }
 
 type brokerAddrResolver interface {
-	ResolveBrokerAddr(nameServerAddrs []string, topic string, brokerName string) (string, error)
+	ResolveBrokerAddr(nameServerAddrs []string, topic string, brokerName string, timeout time.Duration) (string, error)
 }
 
 type tcpSender interface {
 	Send(addr string, data []byte, timeout time.Duration) error
+	Close() error
 }
 
 type defaultBrokerAddrResolver struct{}
 
-func (r *defaultBrokerAddrResolver) ResolveBrokerAddr(nameServerAddrs []string, topic string, brokerName string) (string, error) {
+func (r *defaultBrokerAddrResolver) ResolveBrokerAddr(nameServerAddrs []string, topic string, brokerName string, timeout time.Duration) (string, error) {
 	for _, nsAddr := range nameServerAddrs {
-		addr, err := queryBrokerAddrFromNameServer(nsAddr, topic, brokerName)
+		addr, err := queryBrokerAddrFromNameServer(nsAddr, topic, brokerName, timeout)
 		if err == nil && addr != "" {
 			return addr, nil
 		}
@@ -224,46 +230,175 @@ func (r *defaultBrokerAddrResolver) ResolveBrokerAddr(nameServerAddrs []string, 
 	return "", fmt.Errorf("broker %s addr not found from name servers", brokerName)
 }
 
-type defaultTCPSender struct{}
+type connPool struct {
+	addr       string
+	conns      chan net.Conn
+	lastUsedAt int64 // atomic, unix timestamp
+	closed     int32 // atomic
+}
+
+func newConnPool(addr string, size int) *connPool {
+	if size <= 0 {
+		size = defaultConnPoolSize
+	}
+	return &connPool{
+		addr:       addr,
+		conns:      make(chan net.Conn, size),
+		lastUsedAt: time.Now().Unix(),
+	}
+}
+
+// get returns a connection and a bool indicating whether it was freshly
+// dialled (true) or reused from the pool (false).
+func (p *connPool) get(timeout time.Duration) (net.Conn, bool, error) {
+	atomic.StoreInt64(&p.lastUsedAt, time.Now().Unix())
+	select {
+	case conn := <-p.conns:
+		return conn, false, nil
+	default:
+	}
+	conn, err := net.DialTimeout("tcp", p.addr, timeout)
+	return conn, true, err
+}
+
+func (p *connPool) put(conn net.Conn) {
+	if atomic.LoadInt32(&p.closed) == 1 {
+		conn.Close()
+		return
+	}
+	select {
+	case p.conns <- conn:
+	default:
+		conn.Close()
+	}
+}
+
+func (p *connPool) closeAll() {
+	atomic.StoreInt32(&p.closed, 1)
+	for {
+		select {
+		case conn := <-p.conns:
+			conn.Close()
+		default:
+			return
+		}
+	}
+}
+
+type defaultTCPSender struct {
+	pools         sync.Map // addr -> *connPool
+	poolSize      int
+	lastCleanedAt int64 // atomic, unix timestamp
+}
+
+func newDefaultTCPSender(poolSize int) *defaultTCPSender {
+	if poolSize <= 0 {
+		poolSize = defaultConnPoolSize
+	}
+	return &defaultTCPSender{
+		poolSize:      poolSize,
+		lastCleanedAt: time.Now().Unix(),
+	}
+}
 
 func (s *defaultTCPSender) Send(addr string, data []byte, timeout time.Duration) error {
-	conn, err := net.DialTimeout("tcp", addr, timeout)
+	s.cleanIdlePoolsIfNeeded()
+
+	poolAny, _ := s.pools.LoadOrStore(addr, newConnPool(addr, s.poolSize))
+	pool := poolAny.(*connPool)
+
+	conn, isNew, err := pool.get(timeout)
 	if err != nil {
 		return fmt.Errorf("dial broker %s failed: %w", addr, err)
 	}
-	defer conn.Close()
 
-	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
-		return fmt.Errorf("set write deadline failed: %w", err)
-	}
-	if _, err := conn.Write(data); err != nil {
-		return fmt.Errorf("write to broker %s failed: %w", addr, err)
+	sendAndRead := func(c net.Conn) error {
+		if err := c.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+			return fmt.Errorf("set write deadline failed: %w", err)
+		}
+		if _, err := c.Write(data); err != nil {
+			return fmt.Errorf("write to broker %s failed: %w", addr, err)
+		}
+
+		if err := c.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+			return fmt.Errorf("set read deadline failed: %w", err)
+		}
+		frameLenBuf := make([]byte, 4)
+		if _, err := io.ReadFull(c, frameLenBuf); err != nil {
+			return fmt.Errorf("read response frame length from broker %s failed: %w", addr, err)
+		}
+		frameLen := int(binary.BigEndian.Uint32(frameLenBuf))
+		if frameLen < 8 {
+			return fmt.Errorf("broker %s response frame too short: %d", addr, frameLen)
+		}
+		if frameLen > maxFrameSize {
+			return fmt.Errorf("broker %s response frame too large: %d", addr, frameLen)
+		}
+		frameBuf := make([]byte, frameLen)
+		if _, err := io.ReadFull(c, frameBuf); err != nil {
+			return fmt.Errorf("read response frame from broker %s failed: %w", addr, err)
+		}
+
+		code := int16(binary.BigEndian.Uint16(frameBuf[4:6]))
+		if code != 0 {
+			return fmt.Errorf("broker %s rejected END_TRANSACTION, responseCode=%d", addr, code)
+		}
+		return nil
 	}
 
-	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
-		return fmt.Errorf("set read deadline failed: %w", err)
-	}
-	frameLenBuf := make([]byte, 4)
-	if _, err := readFull(conn, frameLenBuf); err != nil {
-		return fmt.Errorf("read response frame length from broker %s failed: %w", addr, err)
-	}
-	frameLen := int(binary.BigEndian.Uint32(frameLenBuf))
-	if frameLen < 8 {
-		return fmt.Errorf("broker %s response frame too short: %d", addr, frameLen)
-	}
-	if frameLen > maxFrameSize {
-		return fmt.Errorf("broker %s response frame too large: %d", addr, frameLen)
-	}
-	frameBuf := make([]byte, frameLen)
-	if _, err := readFull(conn, frameBuf); err != nil {
-		return fmt.Errorf("read response frame from broker %s failed: %w", addr, err)
+	if err := sendAndRead(conn); err != nil {
+		conn.Close()
+		// If the connection was pooled (not freshly dialled), it may have
+		// been closed by the broker during idle time. Retry once with a
+		// fresh connection before giving up.
+		if !isNew {
+			freshConn, dialErr := net.DialTimeout("tcp", addr, timeout)
+			if dialErr == nil {
+				if retryErr := sendAndRead(freshConn); retryErr != nil {
+					freshConn.Close()
+					return retryErr
+				}
+				pool.put(freshConn)
+				return nil
+			}
+		}
+		return err
 	}
 
-	code := int16(binary.BigEndian.Uint16(frameBuf[4:6]))
-	if code != 0 {
-		return fmt.Errorf("broker %s rejected END_TRANSACTION, responseCode=%d", addr, code)
-	}
+	pool.put(conn)
 	return nil
+}
+
+func (s *defaultTCPSender) Close() error {
+	s.pools.Range(func(key, value interface{}) bool {
+		pool := value.(*connPool)
+		if _, loaded := s.pools.LoadAndDelete(key); loaded {
+			pool.closeAll()
+		}
+		return true
+	})
+	return nil
+}
+
+func (s *defaultTCPSender) cleanIdlePoolsIfNeeded() {
+	now := time.Now().Unix()
+	lastClean := atomic.LoadInt64(&s.lastCleanedAt)
+	if now-lastClean < int64(connPoolCleanInterval) {
+		return
+	}
+	if !atomic.CompareAndSwapInt64(&s.lastCleanedAt, lastClean, now) {
+		return
+	}
+
+	s.pools.Range(func(key, value interface{}) bool {
+		pool := value.(*connPool)
+		if now-atomic.LoadInt64(&pool.lastUsedAt) > int64(connPoolIdleTimeout) {
+			if _, loaded := s.pools.LoadAndDelete(key); loaded {
+				pool.closeAll()
+			}
+		}
+		return true
+	})
 }
 
 func sendEndTransaction(
@@ -275,7 +410,7 @@ func sendEndTransaction(
 	resolver brokerAddrResolver,
 	sender tcpSender,
 ) error {
-	brokerAddr, err := resolver.ResolveBrokerAddr(nameServerAddrs, topic, brokerName)
+	brokerAddr, err := resolver.ResolveBrokerAddr(nameServerAddrs, topic, brokerName, timeout)
 	if err != nil {
 		return fmt.Errorf("resolve broker addr failed: %w", err)
 	}
@@ -294,7 +429,7 @@ func sendEndTransaction(
 	return nil
 }
 
-func queryBrokerAddrFromNameServer(nameServerAddr string, topic string, brokerName string) (string, error) {
+func queryBrokerAddrFromNameServer(nameServerAddr string, topic string, brokerName string, timeout time.Duration) (string, error) {
 	cmd := &remotingCommand{
 		Code:     reqGetRouteInfoByTopic,
 		Language: rmqLanguageGo,
@@ -310,24 +445,24 @@ func queryBrokerAddrFromNameServer(nameServerAddr string, topic string, brokerNa
 		return "", fmt.Errorf("encode route request failed: %w", err)
 	}
 
-	conn, err := net.DialTimeout("tcp", nameServerAddr, 3*time.Second)
+	conn, err := net.DialTimeout("tcp", nameServerAddr, timeout)
 	if err != nil {
 		return "", fmt.Errorf("dial name server %s failed: %w", nameServerAddr, err)
 	}
 	defer conn.Close()
 
-	if err := conn.SetWriteDeadline(time.Now().Add(3 * time.Second)); err != nil {
+	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
 		return "", err
 	}
 	if _, err := conn.Write(data); err != nil {
 		return "", fmt.Errorf("send route request failed: %w", err)
 	}
 
-	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
 		return "", err
 	}
 	frameLenBuf := make([]byte, 4)
-	if _, err := readFull(conn, frameLenBuf); err != nil {
+	if _, err := io.ReadFull(conn, frameLenBuf); err != nil {
 		return "", fmt.Errorf("read frame length failed: %w", err)
 	}
 	frameLen := int(binary.BigEndian.Uint32(frameLenBuf))
@@ -339,7 +474,7 @@ func queryBrokerAddrFromNameServer(nameServerAddr string, topic string, brokerNa
 	}
 
 	frameBuf := make([]byte, frameLen)
-	if _, err := readFull(conn, frameBuf); err != nil {
+	if _, err := io.ReadFull(conn, frameBuf); err != nil {
 		return "", fmt.Errorf("read frame data failed: %w", err)
 	}
 
@@ -371,17 +506,13 @@ func queryBrokerAddrFromNameServer(nameServerAddr string, topic string, brokerNa
 	return parseBrokerAddrFromRouteBody(body, brokerName)
 }
 
-func readFull(conn net.Conn, buf []byte) (int, error) {
-	return io.ReadFull(conn, buf)
-}
-
 func decodeResponseHeader(data []byte) (map[string]string, error) {
 	buf := bytes.NewReader(data)
 
-	if buf.Len() < 13 {
+	if buf.Len() < rmqResponseHeaderFixedPartLength {
 		return nil, fmt.Errorf("header too short for fixed fields")
 	}
-	discard := make([]byte, 13)
+	discard := make([]byte, rmqResponseHeaderFixedPartLength)
 	if _, err := io.ReadFull(buf, discard); err != nil {
 		return nil, err
 	}

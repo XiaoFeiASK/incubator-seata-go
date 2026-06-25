@@ -22,6 +22,8 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"io"
+	"net"
 	"testing"
 	"time"
 
@@ -37,13 +39,15 @@ type stubBrokerAddrResolver struct {
 	lastNsAddrs []string
 	lastTopic   string
 	lastBroker  string
+	lastTimeout time.Duration
 }
 
-func (s *stubBrokerAddrResolver) ResolveBrokerAddr(nameServerAddrs []string, topic string, brokerName string) (string, error) {
+func (s *stubBrokerAddrResolver) ResolveBrokerAddr(nameServerAddrs []string, topic string, brokerName string, timeout time.Duration) (string, error) {
 	s.calls++
 	s.lastNsAddrs = nameServerAddrs
 	s.lastTopic = topic
 	s.lastBroker = brokerName
+	s.lastTimeout = timeout
 	if s.err != nil {
 		return "", s.err
 	}
@@ -65,6 +69,10 @@ func (s *stubTCPSender) Send(addr string, data []byte, timeout time.Duration) er
 	if s.err != nil {
 		return s.err
 	}
+	return nil
+}
+
+func (s *stubTCPSender) Close() error {
 	return nil
 }
 
@@ -468,8 +476,177 @@ func TestDefaultBrokerAddrResolver_TriesAllNameServers(t *testing.T) {
 		[]string{"127.0.0.1:1", "127.0.0.1:1"},
 		"test-topic",
 		"broker-a",
+		3*time.Second,
 	)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "broker")
+}
+
+func TestConnPool_GetAndPut(t *testing.T) {
+	// Start a temporary TCP listener to serve as a fake broker.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 4)
+				if _, err := io.ReadFull(c, buf); err != nil {
+					return
+				}
+				frameLen := binary.BigEndian.Uint32(buf)
+				payload := make([]byte, frameLen)
+				if _, err := io.ReadFull(c, payload); err != nil {
+					return
+				}
+				// Write back a success response (code=0).
+				resp := make([]byte, 8)
+				binary.BigEndian.PutUint32(resp[0:4], 4)
+				binary.BigEndian.PutUint16(resp[4:6], 0)
+				c.Write(resp)
+			}(conn)
+		}
+	}()
+
+	pool := newConnPool(ln.Addr().String(), 2)
+
+	// First get should create a new connection.
+	conn1, isNew1, err := pool.get(3 * time.Second)
+	require.NoError(t, err)
+	require.NotNil(t, conn1)
+	assert.True(t, isNew1)
+
+	// Return the connection to the pool.
+	pool.put(conn1)
+
+	// Second get should reuse the pooled connection.
+	conn2, isNew2, err := pool.get(3 * time.Second)
+	require.NoError(t, err)
+	require.NotNil(t, conn2)
+	assert.False(t, isNew2)
+	assert.Equal(t, conn1.RemoteAddr().String(), conn2.RemoteAddr().String())
+
+	conn2.Close()
+}
+
+func TestConnPool_PutWhenFullClosesConnection(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	pool := newConnPool(ln.Addr().String(), 2)
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	require.NoError(t, err)
+
+	// Fill the pool.
+	for i := 0; i < 2; i++ {
+		c, err := net.Dial("tcp", ln.Addr().String())
+		require.NoError(t, err)
+		pool.put(c)
+	}
+
+	// Putting one more should close it instead of overflowing.
+	pool.put(conn)
+	// The connection should eventually be closed; we just verify no panic.
+}
+
+func TestConnPool_PutAfterClose(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	pool := newConnPool(ln.Addr().String(), 2)
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	require.NoError(t, err)
+
+	pool.closeAll()
+
+	// After closeAll, put should close the connection instead of returning it to the pool.
+	pool.put(conn)
+	// No panic and connection is closed; verified implicitly.
+}
+
+func TestConnPool_GetDialsWhenEmpty(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	pool := newConnPool(ln.Addr().String(), 2)
+
+	// Get from an empty pool should dial a new connection.
+	conn, isNew, err := pool.get(3 * time.Second)
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+	assert.True(t, isNew)
+	conn.Close()
+}
+
+func TestDefaultTCPSender_RetryOnPooledConnFailure(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 4)
+				if _, err := io.ReadFull(c, buf); err != nil {
+					return
+				}
+				frameLen := binary.BigEndian.Uint32(buf)
+				payload := make([]byte, frameLen)
+				if _, err := io.ReadFull(c, payload); err != nil {
+					return
+				}
+				resp, _ := (&remotingCommand{
+					Code:      0,
+					Language:  rmqLanguageGo,
+					Version:   rmqProtocolVersion,
+					Opaque:    1,
+					Flag:      0,
+					Remark:    "",
+					ExtFields: map[string]string{},
+				}).encode()
+				c.Write(resp)
+			}(conn)
+		}
+	}()
+
+	sender := newDefaultTCPSender(2)
+
+	// Dial a connection, immediately close it, and put the closed conn into the pool.
+	staleConn, err := net.Dial("tcp", ln.Addr().String())
+	require.NoError(t, err)
+	staleConn.Close()
+
+	poolAny, _ := sender.pools.LoadOrStore(ln.Addr().String(), newConnPool(ln.Addr().String(), 2))
+	pool := poolAny.(*connPool)
+	pool.put(staleConn)
+
+	data, err := (&remotingCommand{
+		Code:      reqEndTransaction,
+		Language:  rmqLanguageGo,
+		Version:   rmqProtocolVersion,
+		Opaque:    1,
+		ExtFields: map[string]string{},
+	}).encode()
+	require.NoError(t, err)
+
+	// Send should fail on the stale pooled conn, then retry with a fresh conn and succeed.
+	err = sender.Send(ln.Addr().String(), data, 3*time.Second)
+	require.NoError(t, err)
 }

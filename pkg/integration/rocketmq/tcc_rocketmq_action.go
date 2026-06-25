@@ -35,10 +35,14 @@ type TCCRocketMQAction struct {
 }
 
 func NewTCCRocketMQAction(producer *SeataMQProducer) *TCCRocketMQAction {
+	poolSize := defaultConnPoolSize
+	if producer != nil && producer.config != nil && producer.config.ConnPoolSize > 0 {
+		poolSize = producer.config.ConnPoolSize
+	}
 	return &TCCRocketMQAction{
 		producer: producer,
 		resolver: &defaultBrokerAddrResolver{},
-		sender:   &defaultTCPSender{},
+		sender:   newDefaultTCPSender(poolSize),
 	}
 }
 
@@ -90,6 +94,10 @@ func (a *TCCRocketMQAction) Prepare(ctx context.Context, params interface{}) (bo
 }
 
 func (a *TCCRocketMQAction) Commit(ctx context.Context, bac *tm.BusinessActionContext) (bool, error) {
+	if a.producer == nil || a.producer.config == nil {
+		log.Warnf("[TCCRocketMQ] Commit skipped, producer or config is nil, fallback to check-back, xid=%s, branchId=%d", bac.Xid, bac.BranchId)
+		return true, nil
+	}
 	topic := getStringFromMap(bac.ActionContext, ActionContextKeyTopic)
 	brokerName := getStringFromMap(bac.ActionContext, ActionContextKeyBrokerName)
 	if topic == "" || brokerName == "" {
@@ -117,6 +125,10 @@ func (a *TCCRocketMQAction) Commit(ctx context.Context, bac *tm.BusinessActionCo
 }
 
 func (a *TCCRocketMQAction) Rollback(ctx context.Context, bac *tm.BusinessActionContext) (bool, error) {
+	if a.producer == nil || a.producer.config == nil {
+		log.Warnf("[TCCRocketMQ] Rollback skipped, producer or config is nil, fallback to check-back, xid=%s, branchId=%d", bac.Xid, bac.BranchId)
+		return true, nil
+	}
 	topic := getStringFromMap(bac.ActionContext, ActionContextKeyTopic)
 	brokerName := getStringFromMap(bac.ActionContext, ActionContextKeyBrokerName)
 	if topic == "" || brokerName == "" {

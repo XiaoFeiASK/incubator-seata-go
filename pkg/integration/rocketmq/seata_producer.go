@@ -74,6 +74,9 @@ func NewSeataMQProducer(cfg *SeataMQProducerConfig) (*SeataMQProducer, error) {
 	if cfg.SendMsgTimeout <= 0 {
 		cfg.SendMsgTimeout = 3 * time.Second
 	}
+	if cfg.ConnPoolSize <= 0 {
+		cfg.ConnPoolSize = 4
+	}
 
 	p := &SeataMQProducer{
 		config: cfg,
@@ -143,6 +146,11 @@ func (p *SeataMQProducer) Shutdown() error {
 	}
 	if err := p.normalProducer.Shutdown(); err != nil {
 		errs = append(errs, err)
+	}
+	if p.tccAction != nil && p.tccAction.sender != nil {
+		if err := p.tccAction.sender.Close(); err != nil {
+			errs = append(errs, err)
+		}
 	}
 
 	if len(errs) > 0 {
