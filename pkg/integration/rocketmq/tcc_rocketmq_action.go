@@ -170,6 +170,15 @@ func (a *TCCRocketMQAction) buildEndTransactionHeader(bac *tm.BusinessActionCont
 		}
 	}
 
+	// fallback: if offsetMsgId is empty or failed to parse, try msgId (aligned with official client behaviour)
+	if commitLogOffset == 0 {
+		if msgIDStr := getStringFromMap(actionCtx, ActionContextKeyMsgId); msgIDStr != "" {
+			if msgID, err := primitive.UnmarshalMsgID([]byte(msgIDStr)); err == nil {
+				commitLogOffset = msgID.Offset
+			}
+		}
+	}
+
 	return &endTransactionRequestHeader{
 		Topic:                topic,
 		ProducerGroup:        a.producer.config.GroupName,

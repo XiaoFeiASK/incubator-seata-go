@@ -244,9 +244,11 @@ func TestBuildEndTransactionHeader_InvalidOffsetMsgID(t *testing.T) {
 			},
 		},
 	}
+	validMsgID := primitive.CreateMessageId([]byte{10, 93, 233, 58}, 10911, 42)
 	bac := &tm.BusinessActionContext{
 		ActionContext: map[string]interface{}{
 			ActionContextKeyOffsetMsgId: "invalid-id",
+			ActionContextKeyMsgId:       validMsgID,
 			ActionContextKeyQueueOffset: int64(11),
 		},
 	}
@@ -254,7 +256,7 @@ func TestBuildEndTransactionHeader_InvalidOffsetMsgID(t *testing.T) {
 	header := action.buildEndTransactionHeader(bac, "test-topic", commitOrRollbackRollback)
 
 	assert.Equal(t, "test-topic", header.Topic)
-	assert.Equal(t, int64(0), header.CommitLogOffset)
+	assert.Equal(t, int64(42), header.CommitLogOffset)
 	assert.Equal(t, commitOrRollbackRollback, header.CommitOrRollback)
 }
 
