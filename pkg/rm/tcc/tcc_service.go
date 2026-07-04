@@ -101,6 +101,11 @@ func (t *TCCServiceProxy) Prepare(ctx context.Context, params interface{}) (inte
 	return result, nil
 }
 
+// reportActionContext reports the updated ActionContext to TC via BranchReport.
+// It relies on the Seata Server (TC) behavior: AbstractCore.branchReport updates
+// branchSession.applicationData, which will be delivered back to RM during phase-two
+// (branchCommit/branchRollback). If this report fails, phase-two will fall back to
+// broker check-back because the old applicationData lacks RocketMQ metadata.
 func (t *TCCServiceProxy) reportActionContext(ctx context.Context, bac *tm.BusinessActionContext) error {
 	updatedActionContext := make(map[string]interface{})
 	for k, v := range bac.ActionContext {

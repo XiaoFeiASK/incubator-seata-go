@@ -105,7 +105,11 @@ func (a *TCCRocketMQAction) Commit(ctx context.Context, bac *tm.BusinessActionCo
 			topic, brokerName, bac.Xid, bac.BranchId)
 		return true, nil
 	}
-	header := a.buildEndTransactionHeader(bac, topic, commitOrRollbackCommit)
+	header, ok := a.buildEndTransactionHeader(bac, topic, commitOrRollbackCommit)
+	if !ok {
+		log.Warnf("[TCCRocketMQ] Commit cannot resolve valid commitLogOffset, skip active END_TRANSACTION, fallback to check-back, xid=%s, branchId=%d", bac.Xid, bac.BranchId)
+		return true, nil
+	}
 	err := sendEndTransaction(
 		a.producer.config.NameServerAddrs,
 		topic,
@@ -136,7 +140,11 @@ func (a *TCCRocketMQAction) Rollback(ctx context.Context, bac *tm.BusinessAction
 			topic, brokerName, bac.Xid, bac.BranchId)
 		return true, nil
 	}
-	header := a.buildEndTransactionHeader(bac, topic, commitOrRollbackRollback)
+	header, ok := a.buildEndTransactionHeader(bac, topic, commitOrRollbackRollback)
+	if !ok {
+		log.Warnf("[TCCRocketMQ] Rollback cannot resolve valid commitLogOffset, skip active END_TRANSACTION, fallback to check-back, xid=%s, branchId=%d", bac.Xid, bac.BranchId)
+		return true, nil
+	}
 	err := sendEndTransaction(
 		a.producer.config.NameServerAddrs,
 		topic,
@@ -155,7 +163,7 @@ func (a *TCCRocketMQAction) Rollback(ctx context.Context, bac *tm.BusinessAction
 	return true, nil
 }
 
-func (a *TCCRocketMQAction) buildEndTransactionHeader(bac *tm.BusinessActionContext, topic string, commitOrRollback int) *endTransactionRequestHeader {
+func (a *TCCRocketMQAction) buildEndTransactionHeader(bac *tm.BusinessActionContext, topic string, commitOrRollback int) (*endTransactionRequestHeader, bool) {
 	actionCtx := bac.ActionContext
 	if actionCtx == nil {
 		actionCtx = make(map[string]interface{})
@@ -170,13 +178,16 @@ func (a *TCCRocketMQAction) buildEndTransactionHeader(bac *tm.BusinessActionCont
 		}
 	}
 
-	// fallback: if offsetMsgId is empty or failed to parse, try msgId (aligned with official client behaviour)
 	if commitLogOffset == 0 {
 		if msgIDStr := getStringFromMap(actionCtx, ActionContextKeyMsgId); msgIDStr != "" {
 			if msgID, err := primitive.UnmarshalMsgID([]byte(msgIDStr)); err == nil {
 				commitLogOffset = msgID.Offset
 			}
 		}
+	}
+
+	if commitLogOffset == 0 {
+		return nil, false
 	}
 
 	return &endTransactionRequestHeader{
@@ -188,5 +199,5 @@ func (a *TCCRocketMQAction) buildEndTransactionHeader(bac *tm.BusinessActionCont
 		FromTransactionCheck: false,
 		MsgID:                getStringFromMap(actionCtx, ActionContextKeyMsgId),
 		TransactionId:        getStringFromMap(actionCtx, ActionContextKeyTransactionId),
-	}
+	}, true
 }
