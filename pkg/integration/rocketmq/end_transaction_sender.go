@@ -249,7 +249,7 @@ func newConnPool(addr string, size int) *connPool {
 }
 
 // get returns a connection and a bool indicating whether it was freshly
-// dialled (true) or reused from the pool (false).
+// dialed (true) or reused from the pool (false).
 func (p *connPool) get(timeout time.Duration) (net.Conn, bool, error) {
 	atomic.StoreInt64(&p.lastUsedAt, time.Now().Unix())
 	select {
@@ -348,7 +348,7 @@ func (s *defaultTCPSender) Send(addr string, data []byte, timeout time.Duration)
 
 	if err := sendAndRead(conn); err != nil {
 		conn.Close()
-		// If the connection was pooled (not freshly dialled), it may have
+		// If the connection was pooled (not freshly dialed), it may have
 		// been closed by the broker during idle time. Retry once with a
 		// fresh connection before giving up.
 		if !isNew {
