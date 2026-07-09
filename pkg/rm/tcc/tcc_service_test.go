@@ -341,7 +341,7 @@ func GetTestTwoPhaseService() rm.TwoPhaseInterface {
 
 func TestReportActionContext(t *testing.T) {
 	var capturedParam rm.BranchReportParam
-	patches := gomonkey.ApplyMethod(reflect.TypeOf(rm.GetRMRemotingInstance()), "BranchReport", func(_ *rm.RMRemoting, param rm.BranchReportParam) error {
+	patches := gomonkey.ApplyMethod(reflect.TypeOf(rm.GetRMRemotingInstance()), "BranchReport", func(_ *getty.GettyRMRemoting, param rm.BranchReportParam) error {
 		capturedParam = param
 		return nil
 	})
@@ -373,7 +373,7 @@ func TestReportActionContext(t *testing.T) {
 }
 
 func TestReportActionContext_BranchReportFails(t *testing.T) {
-	patches := gomonkey.ApplyMethod(reflect.TypeOf(rm.GetRMRemotingInstance()), "BranchReport", func(_ *rm.RMRemoting, param rm.BranchReportParam) error {
+	patches := gomonkey.ApplyMethod(reflect.TypeOf(rm.GetRMRemotingInstance()), "BranchReport", func(_ *getty.GettyRMRemoting, param rm.BranchReportParam) error {
 		return fmt.Errorf("network error")
 	})
 	defer patches.Reset()
