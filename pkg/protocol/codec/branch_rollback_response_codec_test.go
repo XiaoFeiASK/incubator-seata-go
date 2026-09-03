@@ -18,6 +18,7 @@
 package codec
 
 import (
+	"strings"
 	"testing"
 
 	serror "seata.apache.org/seata-go/v2/pkg/util/errors"
@@ -50,4 +51,31 @@ func TestBranchRollbackResponseCodec(t *testing.T) {
 	msg2 := codec.Decode(bytes)
 
 	assert.Equal(t, msg, msg2)
+}
+
+func TestBranchRollbackResponseCodec_TruncatesLongMessageWithoutShiftingFields(t *testing.T) {
+	msg := message.BranchRollbackResponse{
+		AbstractBranchEndResponse: message.AbstractBranchEndResponse{
+			Xid:          "xid",
+			BranchId:     123,
+			BranchStatus: model2.BranchStatusPhasetwoRollbackFailedRetryable,
+			AbstractTransactionResponse: message.AbstractTransactionResponse{
+				TransactionErrorCode: serror.TransactionErrorCodeBranchRollbackFailedRetriable,
+				AbstractResultMessage: message.AbstractResultMessage{
+					ResultCode: message.ResultCodeFailed,
+					Msg:        strings.Repeat("x", 300),
+				},
+			},
+		},
+	}
+
+	codec := BranchRollbackResponseCodec{}
+	decoded := codec.Decode(codec.Encode(msg)).(message.BranchRollbackResponse)
+
+	assert.Equal(t, message.ResultCodeFailed, decoded.ResultCode)
+	assert.Equal(t, strings.Repeat("x", 127), decoded.Msg)
+	assert.Equal(t, msg.TransactionErrorCode, decoded.TransactionErrorCode)
+	assert.Equal(t, msg.Xid, decoded.Xid)
+	assert.Equal(t, msg.BranchId, decoded.BranchId)
+	assert.Equal(t, msg.BranchStatus, decoded.BranchStatus)
 }
