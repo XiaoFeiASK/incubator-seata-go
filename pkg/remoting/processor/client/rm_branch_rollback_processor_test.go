@@ -19,93 +19,125 @@ package client
 
 import (
 	"context"
+	"errors"
 	"testing"
 
-	"seata.apache.org/seata-go/v2/pkg/rm/tcc"
-
-	model2 "seata.apache.org/seata-go/v2/pkg/protocol/branch"
-	"seata.apache.org/seata-go/v2/pkg/protocol/codec"
+	"github.com/stretchr/testify/require"
+	"seata.apache.org/seata-go/v2/pkg/protocol/branch"
 	"seata.apache.org/seata-go/v2/pkg/protocol/message"
-	"seata.apache.org/seata-go/v2/pkg/remoting/config"
 	"seata.apache.org/seata-go/v2/pkg/remoting/grpc/pb"
 	"seata.apache.org/seata-go/v2/pkg/rm"
 )
 
-func TestRmBranchRollbackProcessor(t *testing.T) {
-	// testcases
-	tests := []struct {
-		name     string             // testcase name
-		protocol string             // protocol:seata/grpc
-		rpcMsg   message.RpcMessage // rpcMessage case
-		wantErr  bool               // want testcase err or not
-	}{
-		{
-			name:     "rbr-testcase1-failure",
-			protocol: "seata",
-			rpcMsg: message.RpcMessage{
-				ID:         223,
-				Type:       message.RequestType(message.MessageTypeBranchRollback),
-				Codec:      byte(codec.CodecTypeSeata),
-				Compressor: byte(1),
-				HeadMap: map[string]string{
-					"name":    " Jack",
-					"age":     "12",
-					"address": "Beijing",
-				},
-				Body: message.BranchRollbackRequest{
-					AbstractBranchEndRequest: message.AbstractBranchEndRequest{
-						Xid:             "123345",
-						BranchId:        56679,
-						BranchType:      model2.BranchTypeTCC,
-						ResourceId:      "1232324",
-						ApplicationData: []byte("TestExtraData"),
-					},
-				},
-			},
+func TestRmBranchRollbackProcessor_SendsFailureResponse(t *testing.T) {
+	bizErr := errors.New("rollback failed")
+	manager := &testResourceManager{rollbackStatus: branch.BranchStatusPhasetwoRollbackFailedRetryable, rollbackErr: bizErr}
 
-			wantErr: true, // need dail to server, so err accured
-		},
-		{
-			name:     "rbr-testcase2-failure",
-			protocol: "grpc",
-			rpcMsg: message.RpcMessage{
-				ID:   223,
-				Type: message.RequestType(message.MessageTypeBranchRollback),
-				HeadMap: map[string]string{
-					"name":    " Jack",
-					"age":     "12",
-					"address": "Beijing",
-				},
-				Body: &pb.BranchRollbackRequestProto{
-					AbstractBranchEndRequest: &pb.AbstractBranchEndRequestProto{
-						Xid:             "123345",
-						BranchId:        56679,
-						BranchType:      pb.BranchTypeProto_TCC,
-						ResourceId:      "1232324",
-						ApplicationData: "TestExtraData",
-					},
-				},
-			},
+	t.Run("getty", func(t *testing.T) {
+		var sent interface{}
+		processor := rmBranchRollbackProcessor{
+			getResourceManager: func(branch.BranchType) rm.ResourceManager { return manager },
+			sendGettyResponse:  func(_ int32, response interface{}) error { sent = response; return nil },
+		}
+		err := processor.handleGettyBranchRollback(context.Background(), message.RpcMessage{ID: 1, Body: message.BranchRollbackRequest{
+			AbstractBranchEndRequest: message.AbstractBranchEndRequest{Xid: "xid", BranchId: 7, BranchType: branch.BranchTypeTCC, ResourceId: "resource"},
+		}})
+		require.NoError(t, err)
+		got := sent.(message.BranchRollbackResponse)
+		require.Equal(t, message.ResultCodeFailed, got.ResultCode)
+		require.Equal(t, bizErr.Error(), got.Msg)
+		require.Equal(t, manager.rollbackStatus, got.BranchStatus)
+		require.Equal(t, "xid", got.Xid)
+		require.Equal(t, int64(7), got.BranchId)
+	})
 
-			wantErr: true, // need dail to server, so err accured
-		},
-	}
+	t.Run("grpc", func(t *testing.T) {
+		var sent interface{}
+		processor := rmBranchRollbackProcessor{
+			getResourceManager: func(branch.BranchType) rm.ResourceManager { return manager },
+			sendGrpcResponse:   func(_ int32, response interface{}) error { sent = response; return nil },
+		}
+		err := processor.handleGrpcBranchRollback(context.Background(), message.RpcMessage{ID: 1, Body: &pb.BranchRollbackRequestProto{
+			AbstractBranchEndRequest: &pb.AbstractBranchEndRequestProto{Xid: "xid", BranchId: 7, BranchType: pb.BranchTypeProto_TCC, ResourceId: "resource"},
+		}})
+		require.NoError(t, err)
+		got := sent.(*pb.BranchRollbackResponseProto)
+		result := got.AbstractBranchEndResponse.AbstractTransactionResponse.AbstractResultMessage
+		require.Equal(t, pb.ResultCodeProto_Failed, result.ResultCode)
+		require.Equal(t, bizErr.Error(), result.Msg)
+		require.Equal(t, pb.BranchStatusProto(manager.rollbackStatus), got.AbstractBranchEndResponse.BranchStatus)
+		require.Equal(t, "xid", got.AbstractBranchEndResponse.Xid)
+		require.Equal(t, int64(7), got.AbstractBranchEndResponse.BranchId)
+	})
+}
 
-	var ctx context.Context
-	var rbrProcessor rmBranchRollbackProcessor
+func TestRmBranchRollbackProcessor_ObservesBusinessAndSendErrors(t *testing.T) {
+	bizErr := errors.New("rollback failed")
+	sendErr := errors.New("send failed")
+	manager := &testResourceManager{rollbackStatus: branch.BranchStatusPhasetwoRollbackFailedRetryable, rollbackErr: bizErr}
 
-	// run tests
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			config.InitTransportConfig(&config.TransportConfig{Protocol: tc.protocol})
+	t.Run("getty", func(t *testing.T) {
+		processor := rmBranchRollbackProcessor{
+			getResourceManager: func(branch.BranchType) rm.ResourceManager { return manager },
+			sendGettyResponse:  func(int32, interface{}) error { return sendErr },
+		}
+		err := processor.handleGettyBranchRollback(context.Background(), message.RpcMessage{ID: 1, Body: message.BranchRollbackRequest{
+			AbstractBranchEndRequest: message.AbstractBranchEndRequest{Xid: "xid", BranchId: 7, BranchType: branch.BranchTypeTCC, ResourceId: "resource"},
+		}})
+		require.ErrorIs(t, err, bizErr)
+		require.ErrorIs(t, err, sendErr)
+	})
 
-			rm.GetRmCacheInstance().RegisterResourceManager(tcc.GetTCCResourceManagerInstance())
+	t.Run("grpc", func(t *testing.T) {
+		processor := rmBranchRollbackProcessor{
+			getResourceManager: func(branch.BranchType) rm.ResourceManager { return manager },
+			sendGrpcResponse:   func(int32, interface{}) error { return sendErr },
+		}
+		err := processor.handleGrpcBranchRollback(context.Background(), message.RpcMessage{ID: 1, Body: &pb.BranchRollbackRequestProto{
+			AbstractBranchEndRequest: &pb.AbstractBranchEndRequestProto{Xid: "xid", BranchId: 7, BranchType: pb.BranchTypeProto_TCC, ResourceId: "resource"},
+		}})
+		require.ErrorIs(t, err, bizErr)
+		require.ErrorIs(t, err, sendErr)
+	})
+}
 
-			err := rbrProcessor.Process(ctx, tc.rpcMsg)
-			if (err != nil) != tc.wantErr {
-				t.Errorf("rmBranchRollbackProcessor wantErr: %v, got: %v", tc.wantErr, err)
-				return
-			}
-		})
-	}
+func TestRmBranchRollbackProcessor_SendsSuccessResponse(t *testing.T) {
+	manager := &testResourceManager{rollbackStatus: branch.BranchStatusPhasetwoRollbacked}
+
+	t.Run("getty", func(t *testing.T) {
+		var sent interface{}
+		processor := rmBranchRollbackProcessor{
+			getResourceManager: func(branch.BranchType) rm.ResourceManager { return manager },
+			sendGettyResponse:  func(_ int32, response interface{}) error { sent = response; return nil },
+		}
+		err := processor.handleGettyBranchRollback(context.Background(), message.RpcMessage{ID: 1, Body: message.BranchRollbackRequest{
+			AbstractBranchEndRequest: message.AbstractBranchEndRequest{Xid: "xid", BranchId: 7, BranchType: branch.BranchTypeTCC, ResourceId: "resource"},
+		}})
+		require.NoError(t, err)
+		got := sent.(message.BranchRollbackResponse)
+		require.Equal(t, message.ResultCodeSuccess, got.ResultCode)
+		require.Empty(t, got.Msg)
+		require.Equal(t, manager.rollbackStatus, got.BranchStatus)
+		require.Equal(t, "xid", got.Xid)
+		require.Equal(t, int64(7), got.BranchId)
+	})
+
+	t.Run("grpc", func(t *testing.T) {
+		var sent interface{}
+		processor := rmBranchRollbackProcessor{
+			getResourceManager: func(branch.BranchType) rm.ResourceManager { return manager },
+			sendGrpcResponse:   func(_ int32, response interface{}) error { sent = response; return nil },
+		}
+		err := processor.handleGrpcBranchRollback(context.Background(), message.RpcMessage{ID: 1, Body: &pb.BranchRollbackRequestProto{
+			AbstractBranchEndRequest: &pb.AbstractBranchEndRequestProto{Xid: "xid", BranchId: 7, BranchType: pb.BranchTypeProto_TCC, ResourceId: "resource"},
+		}})
+		require.NoError(t, err)
+		got := sent.(*pb.BranchRollbackResponseProto)
+		result := got.AbstractBranchEndResponse.AbstractTransactionResponse.AbstractResultMessage
+		require.Equal(t, pb.ResultCodeProto_Success, result.ResultCode)
+		require.Empty(t, result.Msg)
+		require.Equal(t, pb.BranchStatusProto(manager.rollbackStatus), got.AbstractBranchEndResponse.BranchStatus)
+		require.Equal(t, "xid", got.AbstractBranchEndResponse.Xid)
+		require.Equal(t, int64(7), got.AbstractBranchEndResponse.BranchId)
+	})
 }
