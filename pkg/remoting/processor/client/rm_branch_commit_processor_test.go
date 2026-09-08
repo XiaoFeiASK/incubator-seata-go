@@ -24,13 +24,16 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"seata.apache.org/seata-go/v2/pkg/protocol"
 	"seata.apache.org/seata-go/v2/pkg/protocol/branch"
 	"seata.apache.org/seata-go/v2/pkg/protocol/message"
+	"seata.apache.org/seata-go/v2/pkg/remoting/config"
 	"seata.apache.org/seata-go/v2/pkg/remoting/grpc/pb"
 	"seata.apache.org/seata-go/v2/pkg/rm"
 )
 
 type testResourceManager struct {
+	branchType     branch.BranchType
 	commitStatus   branch.BranchStatus
 	commitErr      error
 	rollbackStatus branch.BranchStatus
@@ -53,16 +56,18 @@ func (*testResourceManager) LockQuery(context.Context, rm.LockQueryParam) (bool,
 func (*testResourceManager) RegisterResource(rm.Resource) error   { return nil }
 func (*testResourceManager) UnregisterResource(rm.Resource) error { return nil }
 func (*testResourceManager) GetCachedResources() *sync.Map        { return &sync.Map{} }
-func (*testResourceManager) GetBranchType() branch.BranchType     { return branch.BranchTypeTCC }
+func (m *testResourceManager) GetBranchType() branch.BranchType   { return m.branchType }
 
 func TestBranchEndResult(t *testing.T) {
 	bizErr := errors.New("operation failed")
 	failed := newBranchEndResult(branch.BranchStatusPhasetwoCommitFailedRetryable, bizErr)
 	require.Equal(t, message.ResultCodeFailed, failed.resultCode)
+	require.Equal(t, pb.ResultCodeProto_Failed, branchEndResultCodeProto(failed.resultCode))
 	require.Equal(t, bizErr.Error(), failed.errMsg)
 
 	success := newBranchEndResult(branch.BranchStatusPhasetwoCommitted, nil)
 	require.Equal(t, message.ResultCodeSuccess, success.resultCode)
+	require.Equal(t, pb.ResultCodeProto_Success, branchEndResultCodeProto(success.resultCode))
 	require.Empty(t, success.errMsg)
 
 	sendErr := errors.New("send failed")
@@ -71,6 +76,19 @@ func TestBranchEndResult(t *testing.T) {
 	combined := branchEndProcessError(bizErr, sendErr)
 	require.ErrorIs(t, combined, bizErr)
 	require.ErrorIs(t, combined, sendErr)
+
+	injectedManager := &testResourceManager{}
+	require.Same(t, injectedManager, branchEndResourceManager(
+		func(branch.BranchType) rm.ResourceManager { return injectedManager },
+		branch.BranchTypeTCC,
+	))
+
+	fallbackType := branch.BranchType(99)
+	fallbackManager := &testResourceManager{branchType: fallbackType}
+	rmCache := rm.GetRmCacheInstance()
+	rmCache.RegisterResourceManager(fallbackManager)
+	t.Cleanup(func() { rmCache.UnregisterResourceManager(fallbackType) })
+	require.Same(t, fallbackManager, branchEndResourceManager(nil, fallbackType))
 }
 
 func TestRmBranchCommitProcessor_SendsFailureResponse(t *testing.T) {
@@ -81,7 +99,7 @@ func TestRmBranchCommitProcessor_SendsFailureResponse(t *testing.T) {
 		var sent interface{}
 		processor := rmBranchCommitProcessor{
 			getResourceManager: func(branch.BranchType) rm.ResourceManager { return manager },
-			sendGettyResponse:  func(_ int32, response interface{}) error { sent = response; return nil },
+			sendResponse:       func(_ int32, response interface{}) error { sent = response; return nil },
 		}
 		err := processor.handleGettyBranchCommit(context.Background(), message.RpcMessage{ID: 1, Body: message.BranchCommitRequest{
 			AbstractBranchEndRequest: message.AbstractBranchEndRequest{Xid: "xid", BranchId: 7, BranchType: branch.BranchTypeTCC, ResourceId: "resource"},
@@ -99,7 +117,7 @@ func TestRmBranchCommitProcessor_SendsFailureResponse(t *testing.T) {
 		var sent interface{}
 		processor := rmBranchCommitProcessor{
 			getResourceManager: func(branch.BranchType) rm.ResourceManager { return manager },
-			sendGrpcResponse:   func(_ int32, response interface{}) error { sent = response; return nil },
+			sendResponse:       func(_ int32, response interface{}) error { sent = response; return nil },
 		}
 		err := processor.handleGrpcBranchCommit(context.Background(), message.RpcMessage{ID: 1, Body: &pb.BranchCommitRequestProto{
 			AbstractBranchEndRequest: &pb.AbstractBranchEndRequestProto{Xid: "xid", BranchId: 7, BranchType: pb.BranchTypeProto_TCC, ResourceId: "resource"},
@@ -123,7 +141,7 @@ func TestRmBranchCommitProcessor_ObservesBusinessAndSendErrors(t *testing.T) {
 	t.Run("getty", func(t *testing.T) {
 		processor := rmBranchCommitProcessor{
 			getResourceManager: func(branch.BranchType) rm.ResourceManager { return manager },
-			sendGettyResponse:  func(int32, interface{}) error { return sendErr },
+			sendResponse:       func(int32, interface{}) error { return sendErr },
 		}
 		err := processor.handleGettyBranchCommit(context.Background(), message.RpcMessage{ID: 1, Body: message.BranchCommitRequest{
 			AbstractBranchEndRequest: message.AbstractBranchEndRequest{Xid: "xid", BranchId: 7, BranchType: branch.BranchTypeTCC, ResourceId: "resource"},
@@ -135,7 +153,7 @@ func TestRmBranchCommitProcessor_ObservesBusinessAndSendErrors(t *testing.T) {
 	t.Run("grpc", func(t *testing.T) {
 		processor := rmBranchCommitProcessor{
 			getResourceManager: func(branch.BranchType) rm.ResourceManager { return manager },
-			sendGrpcResponse:   func(int32, interface{}) error { return sendErr },
+			sendResponse:       func(int32, interface{}) error { return sendErr },
 		}
 		err := processor.handleGrpcBranchCommit(context.Background(), message.RpcMessage{ID: 1, Body: &pb.BranchCommitRequestProto{
 			AbstractBranchEndRequest: &pb.AbstractBranchEndRequestProto{Xid: "xid", BranchId: 7, BranchType: pb.BranchTypeProto_TCC, ResourceId: "resource"},
@@ -152,7 +170,7 @@ func TestRmBranchCommitProcessor_SendsSuccessResponse(t *testing.T) {
 		var sent interface{}
 		processor := rmBranchCommitProcessor{
 			getResourceManager: func(branch.BranchType) rm.ResourceManager { return manager },
-			sendGettyResponse:  func(_ int32, response interface{}) error { sent = response; return nil },
+			sendResponse:       func(_ int32, response interface{}) error { sent = response; return nil },
 		}
 		err := processor.handleGettyBranchCommit(context.Background(), message.RpcMessage{ID: 1, Body: message.BranchCommitRequest{
 			AbstractBranchEndRequest: message.AbstractBranchEndRequest{Xid: "xid", BranchId: 7, BranchType: branch.BranchTypeTCC, ResourceId: "resource"},
@@ -170,7 +188,7 @@ func TestRmBranchCommitProcessor_SendsSuccessResponse(t *testing.T) {
 		var sent interface{}
 		processor := rmBranchCommitProcessor{
 			getResourceManager: func(branch.BranchType) rm.ResourceManager { return manager },
-			sendGrpcResponse:   func(_ int32, response interface{}) error { sent = response; return nil },
+			sendResponse:       func(_ int32, response interface{}) error { sent = response; return nil },
 		}
 		err := processor.handleGrpcBranchCommit(context.Background(), message.RpcMessage{ID: 1, Body: &pb.BranchCommitRequestProto{
 			AbstractBranchEndRequest: &pb.AbstractBranchEndRequestProto{Xid: "xid", BranchId: 7, BranchType: pb.BranchTypeProto_TCC, ResourceId: "resource"},
@@ -184,4 +202,48 @@ func TestRmBranchCommitProcessor_SendsSuccessResponse(t *testing.T) {
 		require.Equal(t, "xid", got.AbstractBranchEndResponse.Xid)
 		require.Equal(t, int64(7), got.AbstractBranchEndResponse.BranchId)
 	})
+}
+
+func TestRmBranchCommitProcessor_ProcessRoutesByProtocol(t *testing.T) {
+	previous := config.GetTransportConfig()
+	t.Cleanup(func() { config.InitTransportConfig(previous) })
+
+	manager := &testResourceManager{commitStatus: branch.BranchStatusPhasetwoCommitted}
+	tests := []struct {
+		name     string
+		protocol protocol.Protocol
+		body     interface{}
+		wantType interface{}
+	}{
+		{
+			name:     "seata",
+			protocol: protocol.ProtocolSEATA,
+			body: message.BranchCommitRequest{AbstractBranchEndRequest: message.AbstractBranchEndRequest{
+				Xid: "xid", BranchId: 7, BranchType: branch.BranchTypeTCC, ResourceId: "resource",
+			}},
+			wantType: message.BranchCommitResponse{},
+		},
+		{
+			name:     "grpc",
+			protocol: protocol.ProtocolGRPC,
+			body: &pb.BranchCommitRequestProto{AbstractBranchEndRequest: &pb.AbstractBranchEndRequestProto{
+				Xid: "xid", BranchId: 7, BranchType: pb.BranchTypeProto_TCC, ResourceId: "resource",
+			}},
+			wantType: (*pb.BranchCommitResponseProto)(nil),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config.InitTransportConfig(&config.TransportConfig{Protocol: tt.protocol.String()})
+			var sent interface{}
+			processor := rmBranchCommitProcessor{
+				getResourceManager: func(branch.BranchType) rm.ResourceManager { return manager },
+				sendResponse:       func(_ int32, response interface{}) error { sent = response; return nil },
+			}
+
+			require.NoError(t, processor.Process(context.Background(), message.RpcMessage{ID: 1, Body: tt.body}))
+			require.IsType(t, tt.wantType, sent)
+		})
+	}
 }

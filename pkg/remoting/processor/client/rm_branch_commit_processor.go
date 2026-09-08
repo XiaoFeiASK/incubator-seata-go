@@ -19,7 +19,6 @@ package client
 
 import (
 	"context"
-	"errors"
 
 	"seata.apache.org/seata-go/v2/pkg/protocol"
 	"seata.apache.org/seata-go/v2/pkg/protocol/branch"
@@ -48,41 +47,7 @@ func initBranchCommit() {
 
 type rmBranchCommitProcessor struct {
 	getResourceManager func(branch.BranchType) rm.ResourceManager
-	sendGrpcResponse   func(int32, interface{}) error
-	sendGettyResponse  func(int32, interface{}) error
-}
-
-// branchEndResult is the protocol-independent result of a branch operation.
-type branchEndResult struct {
-	status     branch.BranchStatus
-	resultCode message.ResultCode
-	errMsg     string
-}
-
-func newBranchEndResult(status branch.BranchStatus, bizErr error) branchEndResult {
-	result := branchEndResult{status: status, resultCode: message.ResultCodeSuccess}
-	if bizErr != nil {
-		result.resultCode = message.ResultCodeFailed
-		result.errMsg = bizErr.Error()
-	}
-	return result
-}
-
-func branchEndProcessError(bizErr, sendErr error) error {
-	if sendErr == nil {
-		return nil
-	}
-	if bizErr == nil {
-		return sendErr
-	}
-	return errors.Join(bizErr, sendErr)
-}
-
-func (f *rmBranchCommitProcessor) resourceManager(branchType branch.BranchType) rm.ResourceManager {
-	if f.getResourceManager != nil {
-		return f.getResourceManager(branchType)
-	}
-	return rm.GetRmCacheInstance().GetResourceManager(branchType)
+	sendResponse       func(int32, interface{}) error
 }
 
 func (f *rmBranchCommitProcessor) Process(ctx context.Context, rpcMessage message.RpcMessage) error {
@@ -109,9 +74,9 @@ func (f *rmBranchCommitProcessor) handleGrpcBranchCommit(ctx context.Context, rp
 		Xid:             xid,
 	}
 
-	status, bizErr := f.resourceManager(branch.BranchType(request.AbstractBranchEndRequest.BranchType)).BranchCommit(ctx, branchResource)
+	status, bizErr := branchEndResourceManager(f.getResourceManager, branch.BranchType(request.AbstractBranchEndRequest.BranchType)).BranchCommit(ctx, branchResource)
 	if bizErr != nil {
-		log.Errorf("branch commit error: %s", bizErr.Error())
+		log.Errorf("branch commit error: xid %s, branchID %d: %s", xid, branchID, bizErr.Error())
 	} else {
 		log.Infof("branch commit success: xid %s, branchID %d, resourceID %s, applicationData %s", xid, branchID, resourceID, applicationData)
 	}
@@ -123,7 +88,7 @@ func (f *rmBranchCommitProcessor) handleGrpcBranchCommit(ctx context.Context, rp
 		AbstractBranchEndResponse: &pb.AbstractBranchEndResponseProto{
 			AbstractTransactionResponse: &pb.AbstractTransactionResponseProto{
 				AbstractResultMessage: &pb.AbstractResultMessageProto{
-					ResultCode: pb.ResultCodeProto(result.resultCode),
+					ResultCode: branchEndResultCodeProto(result.resultCode),
 					Msg:        result.errMsg,
 				},
 			},
@@ -133,7 +98,7 @@ func (f *rmBranchCommitProcessor) handleGrpcBranchCommit(ctx context.Context, rp
 		},
 	}
 
-	sendResponse := f.sendGrpcResponse
+	sendResponse := f.sendResponse
 	if sendResponse == nil {
 		sendResponse = grpc.GetGrpcRemotingClient().SendAsyncResponse
 	}
@@ -160,9 +125,9 @@ func (f *rmBranchCommitProcessor) handleGettyBranchCommit(ctx context.Context, r
 		Xid:             xid,
 	}
 
-	status, bizErr := f.resourceManager(request.BranchType).BranchCommit(ctx, branchResource)
+	status, bizErr := branchEndResourceManager(f.getResourceManager, request.BranchType).BranchCommit(ctx, branchResource)
 	if bizErr != nil {
-		log.Errorf("branch commit error: %s", bizErr.Error())
+		log.Errorf("branch commit error: xid %s, branchID %d: %s", xid, branchID, bizErr.Error())
 	} else {
 		log.Infof("branch commit success: xid %s, branchID %d, resourceID %s, applicationData %s", xid, branchID, resourceID, applicationData)
 	}
@@ -183,7 +148,7 @@ func (f *rmBranchCommitProcessor) handleGettyBranchCommit(ctx context.Context, r
 			BranchStatus: result.status,
 		},
 	}
-	sendResponse := f.sendGettyResponse
+	sendResponse := f.sendResponse
 	if sendResponse == nil {
 		sendResponse = getty.GetGettyRemotingClient().SendAsyncResponse
 	}

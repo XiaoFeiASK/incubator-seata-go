@@ -47,15 +47,7 @@ func initBranchRollback() {
 
 type rmBranchRollbackProcessor struct {
 	getResourceManager func(branch.BranchType) rm.ResourceManager
-	sendGrpcResponse   func(int32, interface{}) error
-	sendGettyResponse  func(int32, interface{}) error
-}
-
-func (f *rmBranchRollbackProcessor) resourceManager(branchType branch.BranchType) rm.ResourceManager {
-	if f.getResourceManager != nil {
-		return f.getResourceManager(branchType)
-	}
-	return rm.GetRmCacheInstance().GetResourceManager(branchType)
+	sendResponse       func(int32, interface{}) error
 }
 
 func (f *rmBranchRollbackProcessor) Process(ctx context.Context, rpcMessage message.RpcMessage) error {
@@ -84,19 +76,19 @@ func (f *rmBranchRollbackProcessor) handleGrpcBranchRollback(ctx context.Context
 		ResourceId:      resourceID,
 		ApplicationData: []byte(applicationData),
 	}
-	status, bizErr := f.resourceManager(branchType).BranchRollback(ctx, branchResource)
+	status, bizErr := branchEndResourceManager(f.getResourceManager, branchType).BranchRollback(ctx, branchResource)
 	if bizErr != nil {
-		log.Errorf("branch rollback error: %s", bizErr.Error())
+		log.Errorf("branch rollback error: xid %s, branchID %d: %s", xid, branchID, bizErr.Error())
 	} else {
 		log.Infof("branch rollback success: xid %s, branchID %d, resourceID %s, applicationData %s", xid, branchID, resourceID, applicationData)
 	}
 	result := newBranchEndResult(status, bizErr)
-	// reply commit response to tc server
+	// reply rollback response to tc server
 	response := &pb.BranchRollbackResponseProto{
 		AbstractBranchEndResponse: &pb.AbstractBranchEndResponseProto{
 			AbstractTransactionResponse: &pb.AbstractTransactionResponseProto{
 				AbstractResultMessage: &pb.AbstractResultMessageProto{
-					ResultCode: pb.ResultCodeProto(result.resultCode),
+					ResultCode: branchEndResultCodeProto(result.resultCode),
 					Msg:        result.errMsg,
 				},
 			},
@@ -105,7 +97,7 @@ func (f *rmBranchRollbackProcessor) handleGrpcBranchRollback(ctx context.Context
 			BranchStatus: pb.BranchStatusProto(result.status),
 		},
 	}
-	sendResponse := f.sendGrpcResponse
+	sendResponse := f.sendResponse
 	if sendResponse == nil {
 		sendResponse = grpc.GetGrpcRemotingClient().SendAsyncResponse
 	}
@@ -132,14 +124,14 @@ func (f *rmBranchRollbackProcessor) handleGettyBranchRollback(ctx context.Contex
 		ResourceId:      resourceID,
 		ApplicationData: applicationData,
 	}
-	status, bizErr := f.resourceManager(request.BranchType).BranchRollback(ctx, branchResource)
+	status, bizErr := branchEndResourceManager(f.getResourceManager, request.BranchType).BranchRollback(ctx, branchResource)
 	if bizErr != nil {
-		log.Errorf("branch rollback error: %s", bizErr.Error())
+		log.Errorf("branch rollback error: xid %s, branchID %d: %s", xid, branchID, bizErr.Error())
 	} else {
 		log.Infof("branch rollback success: xid %s, branchID %d, resourceID %s, applicationData %s", xid, branchID, resourceID, applicationData)
 	}
 	result := newBranchEndResult(status, bizErr)
-	// reply commit response to tc server
+	// reply rollback response to tc server
 	response := message.BranchRollbackResponse{
 		AbstractBranchEndResponse: message.AbstractBranchEndResponse{
 			AbstractTransactionResponse: message.AbstractTransactionResponse{
@@ -153,7 +145,7 @@ func (f *rmBranchRollbackProcessor) handleGettyBranchRollback(ctx context.Contex
 			BranchStatus: result.status,
 		},
 	}
-	sendResponse := f.sendGettyResponse
+	sendResponse := f.sendResponse
 	if sendResponse == nil {
 		sendResponse = getty.GetGettyRemotingClient().SendAsyncResponse
 	}

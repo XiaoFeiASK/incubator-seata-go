@@ -18,6 +18,7 @@
 package codec
 
 import (
+	"math"
 	"strings"
 	"testing"
 
@@ -63,7 +64,7 @@ func TestBranchRollbackResponseCodec_TruncatesLongMessageWithoutShiftingFields(t
 				TransactionErrorCode: serror.TransactionErrorCodeBranchRollbackFailedRetriable,
 				AbstractResultMessage: message.AbstractResultMessage{
 					ResultCode: message.ResultCodeFailed,
-					Msg:        strings.Repeat("x", 300),
+					Msg:        strings.Repeat("x", math.MaxInt16+100),
 				},
 			},
 		},
@@ -73,9 +74,42 @@ func TestBranchRollbackResponseCodec_TruncatesLongMessageWithoutShiftingFields(t
 	decoded := codec.Decode(codec.Encode(msg)).(message.BranchRollbackResponse)
 
 	assert.Equal(t, message.ResultCodeFailed, decoded.ResultCode)
-	assert.Equal(t, strings.Repeat("x", 127), decoded.Msg)
+	assert.Equal(t, strings.Repeat("x", math.MaxInt16), decoded.Msg)
 	assert.Equal(t, msg.TransactionErrorCode, decoded.TransactionErrorCode)
 	assert.Equal(t, msg.Xid, decoded.Xid)
 	assert.Equal(t, msg.BranchId, decoded.BranchId)
 	assert.Equal(t, msg.BranchStatus, decoded.BranchStatus)
+}
+
+// Byte vector derived from Java AbstractResultMessageCodec,
+// AbstractTransactionResponseCodec, and AbstractBranchEndResponseCodec.
+func TestBranchRollbackResponseCodec_JavaWireFormat(t *testing.T) {
+	msg := message.BranchRollbackResponse{
+		AbstractBranchEndResponse: message.AbstractBranchEndResponse{
+			Xid:          "192.168.0.1:8091:1234",
+			BranchId:     5678,
+			BranchStatus: model2.BranchStatusPhasetwoRollbackFailedRetryable,
+			AbstractTransactionResponse: message.AbstractTransactionResponse{
+				TransactionErrorCode: serror.TransactionErrorCodeBranchRollbackFailedRetriable,
+				AbstractResultMessage: message.AbstractResultMessage{
+					ResultCode: message.ResultCodeFailed,
+					Msg:        "storage failed",
+				},
+			},
+		},
+	}
+	want := []byte{
+		0x00,
+		0x00, 0x0e,
+		's', 't', 'o', 'r', 'a', 'g', 'e', ' ', 'f', 'a', 'i', 'l', 'e', 'd',
+		0x04,
+		0x00, 0x15,
+		'1', '9', '2', '.', '1', '6', '8', '.', '0', '.', '1', ':', '8', '0', '9', '1', ':', '1', '2', '3', '4',
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x16, 0x2e,
+		0x09,
+	}
+
+	codec := BranchRollbackResponseCodec{}
+	assert.Equal(t, want, codec.Encode(msg), "encode must reproduce the Java bytes exactly")
+	assert.Equal(t, msg, codec.Decode(want))
 }

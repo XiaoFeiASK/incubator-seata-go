@@ -49,3 +49,36 @@ func TestBranchCommitResponseCodec(t *testing.T) {
 
 	assert.Equal(t, msg, msg2)
 }
+
+// Byte vector derived from Java AbstractResultMessageCodec,
+// AbstractTransactionResponseCodec, and AbstractBranchEndResponseCodec.
+func TestBranchCommitResponseCodec_JavaWireFormat(t *testing.T) {
+	msg := message.BranchCommitResponse{
+		AbstractBranchEndResponse: message.AbstractBranchEndResponse{
+			Xid:          "192.168.0.1:8091:1234",
+			BranchId:     5678,
+			BranchStatus: model2.BranchStatusPhasetwoCommitFailedRetryable,
+			AbstractTransactionResponse: message.AbstractTransactionResponse{
+				TransactionErrorCode: serror.TransactionErrorCodeUnknown,
+				AbstractResultMessage: message.AbstractResultMessage{
+					ResultCode: message.ResultCodeFailed,
+					Msg:        "storage failed",
+				},
+			},
+		},
+	}
+	want := []byte{
+		0x00,
+		0x00, 0x0e,
+		's', 't', 'o', 'r', 'a', 'g', 'e', ' ', 'f', 'a', 'i', 'l', 'e', 'd',
+		0x00,
+		0x00, 0x15,
+		'1', '9', '2', '.', '1', '6', '8', '.', '0', '.', '1', ':', '8', '0', '9', '1', ':', '1', '2', '3', '4',
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x16, 0x2e,
+		0x06,
+	}
+
+	codec := BranchCommitResponseCodec{}
+	assert.Equal(t, want, codec.Encode(msg), "encode must reproduce the Java bytes exactly")
+	assert.Equal(t, msg, codec.Decode(want))
+}
