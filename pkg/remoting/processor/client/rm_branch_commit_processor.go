@@ -98,13 +98,10 @@ func (f *rmBranchCommitProcessor) handleGrpcBranchCommit(ctx context.Context, rp
 		},
 	}
 
-	sendResponse := f.sendResponse
-	if sendResponse == nil {
-		sendResponse = grpc.GetGrpcRemotingClient().SendAsyncResponse
-	}
+	sendResponse := branchEndSendResponse(f.sendResponse, grpc.GetGrpcRemotingClient().SendAsyncResponse)
 	sendErr := sendResponse(rpcMessage.ID, response)
 	if sendErr != nil {
-		log.Errorf("send branch commit response error: {%#v}", sendErr.Error())
+		log.Errorf("send branch commit response error: xid %s, branchID %d: %v", xid, branchID, sendErr)
 	} else {
 		log.Infof("send branch commit response success: xid %s, branchID %v, resourceID %v, applicationData %v", xid, branchID, resourceID, applicationData)
 	}
@@ -148,13 +145,10 @@ func (f *rmBranchCommitProcessor) handleGettyBranchCommit(ctx context.Context, r
 			BranchStatus: result.status,
 		},
 	}
-	sendResponse := f.sendResponse
-	if sendResponse == nil {
-		sendResponse = getty.GetGettyRemotingClient().SendAsyncResponse
-	}
+	sendResponse := branchEndSendResponse(f.sendResponse, getty.GetGettyRemotingClient().SendAsyncResponse)
 	sendErr := sendResponse(rpcMessage.ID, response)
 	if sendErr != nil {
-		log.Errorf("send branch commit response error: {%#v}", sendErr.Error())
+		log.Errorf("send branch commit response error: xid %s, branchID %d: %v", xid, branchID, sendErr)
 	} else {
 		log.Infof("send branch commit response success: xid %s, branchID %v, resourceID %v, applicationData %v", xid, branchID, resourceID, applicationData)
 	}

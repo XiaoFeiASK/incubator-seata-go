@@ -58,6 +58,28 @@ func (*testResourceManager) UnregisterResource(rm.Resource) error { return nil }
 func (*testResourceManager) GetCachedResources() *sync.Map        { return &sync.Map{} }
 func (m *testResourceManager) GetBranchType() branch.BranchType   { return m.branchType }
 
+func TestBranchEndSendResponse(t *testing.T) {
+	injectedCalled := false
+	fallbackCalled := false
+	injected := func(int32, interface{}) error {
+		injectedCalled = true
+		return nil
+	}
+	fallback := func(int32, interface{}) error {
+		fallbackCalled = true
+		return nil
+	}
+
+	require.NoError(t, branchEndSendResponse(injected, fallback)(1, "response"))
+	require.True(t, injectedCalled)
+	require.False(t, fallbackCalled)
+
+	injectedCalled = false
+	require.NoError(t, branchEndSendResponse(nil, fallback)(2, "response"))
+	require.False(t, injectedCalled)
+	require.True(t, fallbackCalled)
+}
+
 func TestBranchEndResult(t *testing.T) {
 	bizErr := errors.New("operation failed")
 	failed := newBranchEndResult(branch.BranchStatusPhasetwoCommitFailedRetryable, bizErr)

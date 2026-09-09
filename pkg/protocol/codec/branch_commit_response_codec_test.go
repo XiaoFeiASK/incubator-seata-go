@@ -18,6 +18,8 @@
 package codec
 
 import (
+	"math"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -48,6 +50,33 @@ func TestBranchCommitResponseCodec(t *testing.T) {
 	msg2 := codec.Decode(bytes)
 
 	assert.Equal(t, msg, msg2)
+}
+
+func TestBranchCommitResponseCodec_TruncatesLongMessageWithoutShiftingFields(t *testing.T) {
+	msg := message.BranchCommitResponse{
+		AbstractBranchEndResponse: message.AbstractBranchEndResponse{
+			Xid:          "xid",
+			BranchId:     123,
+			BranchStatus: model2.BranchStatusPhasetwoCommitFailedRetryable,
+			AbstractTransactionResponse: message.AbstractTransactionResponse{
+				TransactionErrorCode: serror.TransactionErrorCodeFailedToSendBranchCommitRequest,
+				AbstractResultMessage: message.AbstractResultMessage{
+					ResultCode: message.ResultCodeFailed,
+					Msg:        strings.Repeat("x", math.MaxInt16+100),
+				},
+			},
+		},
+	}
+
+	codec := BranchCommitResponseCodec{}
+	decoded := codec.Decode(codec.Encode(msg)).(message.BranchCommitResponse)
+
+	assert.Equal(t, message.ResultCodeFailed, decoded.ResultCode)
+	assert.Equal(t, strings.Repeat("x", math.MaxInt16), decoded.Msg)
+	assert.Equal(t, msg.TransactionErrorCode, decoded.TransactionErrorCode)
+	assert.Equal(t, msg.Xid, decoded.Xid)
+	assert.Equal(t, msg.BranchId, decoded.BranchId)
+	assert.Equal(t, msg.BranchStatus, decoded.BranchStatus)
 }
 
 // Byte vector derived from Java AbstractResultMessageCodec,

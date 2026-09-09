@@ -49,6 +49,16 @@ func branchEndResultCodeProto(resultCode message.ResultCode) pb.ResultCodeProto 
 	return pb.ResultCodeProto_Success
 }
 
+func branchEndSendResponse(
+	sendResponse func(int32, interface{}) error,
+	fallback func(int32, interface{}) error,
+) func(int32, interface{}) error {
+	if sendResponse != nil {
+		return sendResponse
+	}
+	return fallback
+}
+
 func branchEndProcessError(bizErr, sendErr error) error {
 	if sendErr == nil {
 		return nil
